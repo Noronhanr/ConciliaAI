@@ -8,14 +8,15 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth import current_user, make_token, password_hasher
 from app.config import get_settings
 from app.database import get_db
+from app.document_assembly import assemble_batch_documents, format_cnpj
 from app.document_processing import ALLOWED_TYPES, count_pages
-from app.models import Batch, Page, SourceFile, User
+from app.models import Batch, Company, Document, Page, SourceFile, User
 from app.storage import ensure_bucket, upload_stream
 from app.tasks import process_page
 
@@ -62,6 +63,49 @@ class FileOut(BaseModel):
     total_pages: int
     completed_pages: int
     error_pages: int
+
+
+class CompanyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    cnpj: str
+    cnpj_formatted: str
+    razao_social: str
+    nome_fantasia: str | None
+    role: str
+    total_documents: int
+    total_contracts: int
+    total_amendments: int
+    total_invoices: int
+    total_invoiced_value: float
+
+
+class DocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    doc_type: str
+    document_code: str | None
+    title: str | None
+    start_page: int
+    end_page: int
+    status: str
+    confidence: float
+    company_id: int | None
+    source_file_id: int
+    extracted_data: dict | None
+
+
+class ContractWithAmendments(BaseModel):
+    contract: DocumentOut
+    amendments: list[DocumentOut]
+
+
+class DossierOut(BaseModel):
+    company: CompanyOut
+    contracts: list[ContractWithAmendments]
+    invoices: list[DocumentOut]
+    other_documents: list[DocumentOut]
+
 
 
 def owned_batch(batch_id: int, user: User, db: Session) -> Batch:
@@ -200,6 +244,133 @@ def list_pages(batch_id: int, user: User = Depends(current_user),
         SourceFile.batch_id == batch_id).order_by(SourceFile.id, Page.page_number)))
 
 
+@app.post("/batches/{batch_id}/assemble")
+def assemble_batch(batch_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    batch = owned_batch(batch_id, user, db)
+    docs = assemble_batch_documents(db, batch.id)
+    companies_count = len(set(d.company_id for d in docs if d.company_id))
+    return {
+        "batch_id": batch.id,
+        "total_documents": len(docs),
+        "total_companies": companies_count,
+        "status": "assembled",
+    }
+
+
+@app.get("/batches/{batch_id}/companies", response_model=list[CompanyOut])
+def list_companies(batch_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    owned_batch(batch_id, user, db)
+    docs = list(db.scalars(select(Document).where(Document.batch_id == batch_id)))
+    if not docs:
+        docs = assemble_batch_documents(db, batch_id)
+
+    company_ids = {d.company_id for d in docs if d.company_id}
+    if not company_ids:
+        return []
+
+    companies = list(db.scalars(select(Company).where(Company.id.in_(company_ids)).order_by(Company.razao_social)))
+    output = []
+    for comp in companies:
+        comp_docs = [d for d in docs if d.company_id == comp.id]
+        contracts = [d for d in comp_docs if d.doc_type == "contrato"]
+        amendments = [d for d in comp_docs if d.doc_type == "aditivo_contratual"]
+        invoices = [d for d in comp_docs if d.doc_type == "nota_fiscal_servico"]
+
+        invoiced_val = sum(
+            float((d.extracted_data or {}).get("valor") or 0.0)
+            for d in invoices
+            if isinstance((d.extracted_data or {}).get("valor"), (int, float))
+        )
+
+        output.append(CompanyOut(
+            id=comp.id,
+            cnpj=comp.cnpj,
+            cnpj_formatted=format_cnpj(comp.cnpj),
+            razao_social=comp.razao_social,
+            nome_fantasia=comp.nome_fantasia,
+            role=comp.role,
+            total_documents=len(comp_docs),
+            total_contracts=len(contracts),
+            total_amendments=len(amendments),
+            total_invoices=len(invoices),
+            total_invoiced_value=round(invoiced_val, 2),
+        ))
+    return output
+
+
+@app.get("/batches/{batch_id}/companies/{company_id}/dossier", response_model=DossierOut)
+def get_company_dossier(batch_id: int, company_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    owned_batch(batch_id, user, db)
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    docs = list(db.scalars(
+        select(Document).where(Document.batch_id == batch_id, Document.company_id == company_id).order_by(Document.start_page)
+    ))
+
+    contracts = [d for d in docs if d.doc_type == "contrato"]
+    amendments = [d for d in docs if d.doc_type == "aditivo_contratual"]
+    invoices = [d for d in docs if d.doc_type == "nota_fiscal_servico"]
+    others = [d for d in docs if d.doc_type not in ("contrato", "aditivo_contratual", "nota_fiscal_servico")]
+
+    contracts_with_amendments = []
+    assigned_amendment_ids = set()
+    for c in contracts:
+        c_code = c.document_code
+        linked_amendments = []
+        for a in amendments:
+            a_ref = (a.extracted_data or {}).get("contrato_referenciado")
+            if a_ref and c_code and (a_ref.upper() == c_code.upper()):
+                linked_amendments.append(DocumentOut.model_validate(a))
+                assigned_amendment_ids.add(a.id)
+        contracts_with_amendments.append(ContractWithAmendments(
+            contract=DocumentOut.model_validate(c),
+            amendments=linked_amendments,
+        ))
+
+    for a in amendments:
+        if a.id not in assigned_amendment_ids:
+            others.append(a)
+
+    invoiced_val = sum(
+        float((d.extracted_data or {}).get("valor") or 0.0)
+        for d in invoices
+        if isinstance((d.extracted_data or {}).get("valor"), (int, float))
+    )
+
+    comp_out = CompanyOut(
+        id=company.id,
+        cnpj=company.cnpj,
+        cnpj_formatted=format_cnpj(company.cnpj),
+        razao_social=company.razao_social,
+        nome_fantasia=company.nome_fantasia,
+        role=company.role,
+        total_documents=len(docs),
+        total_contracts=len(contracts),
+        total_amendments=len(amendments),
+        total_invoices=len(invoices),
+        total_invoiced_value=round(invoiced_val, 2),
+    )
+
+    return DossierOut(
+        company=comp_out,
+        contracts=contracts_with_amendments,
+        invoices=[DocumentOut.model_validate(inv) for inv in invoices],
+        other_documents=[DocumentOut.model_validate(oth) for oth in others],
+    )
+
+
+@app.get("/batches/{batch_id}/documents", response_model=list[DocumentOut])
+def list_documents(batch_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    owned_batch(batch_id, user, db)
+    docs = list(db.scalars(
+        select(Document).where(Document.batch_id == batch_id).order_by(Document.source_file_id, Document.start_page)
+    ))
+    return [DocumentOut.model_validate(d) for d in docs]
+
+
 @app.get("/")
 def index():
-    return {"product": "Concilia AI", "message": "API Fase 3. Consulte /docs."}
+    return {"product": "Concilia AI", "message": "API Fase 3+. Consulte /docs."}
+

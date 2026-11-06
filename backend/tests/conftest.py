@@ -6,6 +6,7 @@ os.environ['MINIO_ENDPOINT'] = 'localhost:9000'
 
 import pytest
 from fastapi.testclient import TestClient
+
 from app.auth import password_hasher
 from app.database import Base, SessionLocal, engine
 from app.main import app
@@ -24,4 +25,5 @@ def client(monkeypatch):
     with TestClient(app) as c:
         yield c
     Base.metadata.drop_all(bind=engine)
+    engine.dispose()
     Path('/tmp/test_concilia.db').unlink(missing_ok=True)

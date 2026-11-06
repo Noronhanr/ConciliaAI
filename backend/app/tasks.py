@@ -1,8 +1,10 @@
 """Celery: uma tarefa idempotente por página, com persistência de erros."""
 from celery import Celery
-from sqlalchemy import func, select
+from sqlalchemy import select
+
 from app.config import get_settings
 from app.database import SessionLocal
+from app.document_assembly import assemble_batch_documents
 from app.document_processing import extract_page
 from app.models import Batch, Page, SourceFile
 from app.storage import download_bytes
@@ -30,8 +32,14 @@ def _refresh_status(session, file_id: int):
     file_states = list(session.scalars(select(SourceFile.status).where(SourceFile.batch_id == batch.id)))
     if file_states and all(x in ("completed", "error") for x in file_states):
         batch.status = "error" if "error" in file_states else "completed"
+        if batch.status == "completed":
+            try:
+                assemble_batch_documents(session, batch.id)
+            except Exception:
+                pass
     elif any(x in ("processing", "completed") for x in file_states):
         batch.status = "processing"
+
 
 
 @celery_app.task(name="concilia.process_page", bind=True, max_retries=2)
